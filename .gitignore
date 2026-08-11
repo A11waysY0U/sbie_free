@@ -1,0 +1,15 @@
+# 构建产物
+build/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# 运行时生成物（证书 / 密钥 / 备份）
+Certificate.dat
+key.hex
+mypub.hex
+sbie_key_backup.bin
+*.sig.bak
