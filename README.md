@@ -52,6 +52,8 @@ cmd /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxili
 
 ## 使用
 
+把 Va2PaAstra.exe 放到 Sandboxie 安装目录
+
 以管理员身份运行 `Va2PaAstra.exe`（程序检测到未提权会自动请求 UAC）：
 
 1. 填写姓名、选择级别（STANDARD / ADVANCED / ADVANCED1 / HUGE）、有效天数
