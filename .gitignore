@@ -1,4 +1,3 @@
-# 构建产物
 build/
 *.obj
 *.exe
@@ -7,7 +6,6 @@ build/
 *.lib
 *.exp
 
-# 运行时生成物（证书 / 密钥 / 备份）
 Certificate.dat
 key.hex
 mypub.hex
