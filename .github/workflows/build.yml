@@ -26,7 +26,7 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $dir = "build/Release"
+          $dir = "build"
           $out = "SandBoxieUnlocker-${{ github.ref_name }}.zip"
           Compress-Archive -Path "$dir/SandBoxieUnlocker.exe","$dir/RTCore64.sys" -DestinationPath $out
 
