@@ -1,7 +1,7 @@
-// main.cpp — Va2PaAstra Win32 GUI（纯 UI）
+﻿// main.cpp — SandBoxie Unlocker Win32 GUI（纯 UI）
 // ========================================================================
-// 控件输入姓名/级别/天数，点击[开始注册]在工作线程执行 va2pa::RunFlow，
-// 点击[还原签名]执行 va2pa::RunRestore。核心日志经回调转 UTF-16 显示到日志框。
+// 控件输入姓名/级别/天数，点击[开始注册]在工作线程执行 sbu::RunFlow，
+// 点击[还原签名]执行 sbu::RunRestore。核心日志经回调转 UTF-16 显示到日志框。
 // 特性：Common Controls v6 视觉样式、Per-Monitor DPI 感知、微软雅黑 UI 字体、
 //       日志框等宽字体、窗口居中、流程运行期间禁用按钮。
 // ========================================================================
@@ -91,7 +91,7 @@ static void StartFlowAsync(HWND hWnd, const std::string& name,
     EnableWindow(g_hBtnStart, FALSE);
     EnableWindow(g_hBtnRestore, FALSE);
     std::thread([hWnd, name, level, days]() {
-        try { va2pa::RunFlow(name, level, days); }
+        try { sbu::RunFlow(name, level, days); }
         catch (const std::exception& e) { UiLogF("[-] 异常: %s", e.what()); }
         UiLog("----------------------------------------");
         PostMessageW(hWnd, WM_FLOW_DONE, 0, 0);
@@ -103,7 +103,7 @@ static void StartRestoreAsync(HWND hWnd)
     EnableWindow(g_hBtnStart, FALSE);
     EnableWindow(g_hBtnRestore, FALSE);
     std::thread([hWnd]() {
-        try { va2pa::RunRestore(); }
+        try { sbu::RunRestore(); }
         catch (const std::exception& e) { UiLogF("[-] 异常: %s", e.what()); }
         UiLog("----------------------------------------");
         PostMessageW(hWnd, WM_FLOW_DONE, 0, 0);
@@ -246,7 +246,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     // 注册日志回调（核心模块输出 -> 日志框）
-    va2pa::SetLogger(UiLog);
+    sbu::SetLogger(UiLog);
 
     // 创建字体：界面用微软雅黑 UI，日志框用等宽 Consolas
     g_hFontUi = MakeFont(9, false);
@@ -257,7 +257,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.lpszClassName = L"Va2PaGuiClass";
+    wc.lpszClassName = L"sbuGuiClass";
     RegisterClassW(&wc);
 
     // 客户区 400x412，按窗口样式换算含边框的窗口尺寸

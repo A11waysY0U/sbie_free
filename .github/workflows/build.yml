@@ -1,0 +1,32 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "build/Release"
+          $out = "SandBoxieUnlocker-${{ github.ref_name }}.zip"
+          Compress-Archive -Path "$dir/SandBoxieUnlocker.exe","$dir/RTCore64.sys" -DestinationPath $out
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SandBoxieUnlocker-*.zip

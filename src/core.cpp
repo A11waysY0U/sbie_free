@@ -1,7 +1,7 @@
-// core.cpp — Va2PaAstra 核心逻辑实现
+﻿// core.cpp — SandBoxie Unlocker 核心逻辑实现
 // ========================================================================
 // 证书生成 / 驱动服务管理 / SbieDrv.sys 公钥补丁 / .sig 重签 / 还原。
-// 所有日志经 va2pa::Log（回调）输出 UTF-8 单行文本，与 UI 解耦。
+// 所有日志经 sbu::Log（回调）输出 UTF-8 单行文本，与 UI 解耦。
 // ========================================================================
 
 #include "core.h"
@@ -21,10 +21,9 @@
 #include <fstream>
 #include <stdexcept>
 
-#include "astra.h"
-#include "kernel.h"
+#include "rtcore.h"
 
-namespace va2pa {
+namespace sbu {
 
 // ---------------- 常量 ----------------
 static const char* SOFTWARE_NAME = "Sandboxie-Plus";
@@ -231,56 +230,6 @@ static std::string BuildCertificate(const std::string& name, const std::string& 
     return text;
 }
 
-// ---------------- 页表 / 内核（Astra64） ----------------
-static bool TranslateVaToPa(const astra::Astra& drv, uint64_t cr3, uint64_t va, uint64_t& outPa, bool verbose)
-{
-    uint64_t idx[4] = { (va >> 39) & 0x1FF, (va >> 30) & 0x1FF, (va >> 21) & 0x1FF, (va >> 12) & 0x1FF };
-    const char* names[4] = { "PML4", "PDPT", "PD", "PT" };
-
-    uint64_t tablePa = cr3 & 0x000FFFFFFFFFF000ULL;
-    for (int lvl = 0; lvl < 4; lvl++) {
-        uint64_t ptePa = tablePa + idx[lvl] * 8;
-        uint64_t entry;
-        try { entry = drv.read_u64(ptePa); } catch (...) { if (verbose) Log("    %s 读取失败", names[lvl]); return false; }
-        bool present = (entry & 1) != 0;
-        bool large = (entry & 0x80) && (lvl == 1 || lvl == 2);
-        if (verbose)
-            Log("    %s[0x%llX] 槽位PA=0x%llX 项=0x%llX P=%d PS=%d",
-                names[lvl], idx[lvl], ptePa, entry, present ? 1 : 0, (entry & 0x80) ? 1 : 0);
-        if (!present) return false;
-        if (large) {
-            if (lvl == 1) outPa = (entry & 0x000FFFFFC0000000ULL) | (va & 0x3FFFFFFFULL);
-            else          outPa = (entry & 0x000FFFFFFFE00000ULL) | (va & 0x1FFFFFULL);
-            if (verbose) Log("    ^ 命中%s 大页", (lvl == 2) ? " 2MB" : " 1GB");
-            return true;
-        }
-        tablePa = entry & 0x000FFFFFFFFFF000ULL;
-    }
-    outPa = tablePa + (va & 0xFFF);
-    return true;
-}
-
-static uint64_t FindKernelCr3(const astra::Astra& drv, uint64_t knownKernelVa)
-{
-    const uint64_t kusdPml4Idx = (astra::KUSD_VA >> 39) & 0x1FF;
-    std::vector<uint64_t> candidates;
-    for (uint64_t phys_page = 0; phys_page < 0x4000000ULL; phys_page += 0x1000) {
-        uint64_t pml4e;
-        try { pml4e = drv.read_u64(phys_page + kusdPml4Idx * 8); } catch (...) { continue; }
-        if (!(pml4e & 1)) continue;
-        if ((pml4e & 0x000FFFFFFFFFF000ULL) > 0x800000000ULL) continue;
-        candidates.push_back(phys_page);
-    }
-    for (auto cr3 : candidates) {
-        uint64_t kusdPa;
-        if (!kernel::virt_to_phys(drv, cr3, astra::KUSD_VA, kusdPa)) continue;
-        try { if (drv.read_u32(kusdPa + 0x26C) != 10) continue; } catch (...) { continue; }
-        uint64_t pa;
-        if (kernel::virt_to_phys(drv, cr3, knownKernelVa, pa)) return cr3;
-    }
-    return 0;
-}
-
 static uint64_t GetDriverBase(const char* name)
 {
     LPVOID drivers[1024];
@@ -296,12 +245,10 @@ static uint64_t GetDriverBase(const char* name)
     return 0;
 }
 
-static bool GetImageSize(const astra::Astra& drv, uint64_t cr3, uint64_t baseVa, uint64_t& size)
+static bool GetImageSize(const rtcore::RTCore& drv, uint64_t baseVa, uint64_t& size)
 {
-    uint64_t basePa;
-    if (!TranslateVaToPa(drv, cr3, baseVa, basePa, false)) return false;
     BYTE hdr[0x400];
-    try { drv.read_phys(basePa, hdr, sizeof(hdr)); } catch (...) { return false; }
+    try { drv.read_va(baseVa, hdr, sizeof(hdr)); } catch (...) { return false; }
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)hdr;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(hdr + dos->e_lfanew);
@@ -310,19 +257,84 @@ static bool GetImageSize(const astra::Astra& drv, uint64_t cr3, uint64_t baseVa,
     return true;
 }
 
-static bool ScanImageForSig(const astra::Astra& drv, uint64_t cr3, uint64_t baseVa,
-                            uint64_t imageSize, uint64_t& outVa, uint64_t& outPa)
+static bool GetSectionRange(const rtcore::RTCore& drv, uint64_t baseVa,
+                            const char* secName, uint64_t& secVa, uint64_t& secSize,
+                            DWORD& secChars)
 {
-    const SIZE_T kPage = 0x1000;
-    BYTE page[0x1000];
-    for (uint64_t va = baseVa; va < baseVa + imageSize; va += kPage) {
-        uint64_t pagePa;
-        if (!TranslateVaToPa(drv, cr3, va, pagePa, false)) continue;
-        try { drv.read_phys(pagePa, page, kPage); } catch (...) { continue; }
-        for (SIZE_T i = 0; i + kEcs1Len <= kPage; i++)
-            if (memcmp(page + i, kEcs1, kEcs1Len) == 0) {
-                outVa = va + i; outPa = pagePa + i; return true;
-            }
+    BYTE hdr[0x400];
+    try { drv.read_va(baseVa, hdr, sizeof(hdr)); }
+    catch (const std::exception& e) { Log("    [!] read_va(PE头) 失败: %s", e.what()); return false; }
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)hdr;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        Log("    [!] MZ 签名不匹配: e_magic=0x%04X (期望 0x5A4D)", dos->e_magic);
+        return false;
+    }
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(hdr + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        Log("    [!] PE 签名不匹配: e_lfanew=0x%08X, Sig=0x%08X", dos->e_lfanew, nt->Signature);
+        return false;
+    }
+
+    WORD numSections = nt->FileHeader.NumberOfSections;
+    DWORD optHdrSize = nt->FileHeader.SizeOfOptionalHeader;
+    IMAGE_SECTION_HEADER* sec = (IMAGE_SECTION_HEADER*)(hdr + dos->e_lfanew + 4 + 20 + optHdrSize);
+
+    Log("    段表 (%d 个):", numSections);
+
+    for (WORD i = 0; i < numSections; i++) {
+        char name[9] = { 0 };
+        memcpy(name, sec[i].Name, 8);
+        Log("      [%d] %-8s VA=+0x%05X VSize=0x%05X Chars=0x%08X",
+            i, name, sec[i].VirtualAddress, sec[i].Misc.VirtualSize, sec[i].Characteristics);
+        if (_stricmp(name, secName) == 0) {
+            secVa = baseVa + sec[i].VirtualAddress;
+            secSize = sec[i].Misc.VirtualSize;
+            secChars = sec[i].Characteristics;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ScanSectionForSig(const rtcore::RTCore& drv, uint64_t secVa, uint64_t secSize,
+                              uint64_t& outVa)
+{
+    uint64_t end = secVa + secSize;
+    for (uint64_t va = secVa; va + 4 <= end; va += 4) {
+        uint32_t v;
+        try { v = drv.read_u32(va); } catch (...) { continue; }
+        if (v == 0x31534345) {  // "ECS1" little-endian
+            outVa = va;
+            return true;
+        }
+    }
+    return false;
+}
+
+// 扫描所有可写段查找 ECS1 特征（.data 段不存在时的回退方案）
+static bool ScanAllWritableSections(const rtcore::RTCore& drv, uint64_t baseVa, uint64_t& outVa)
+{
+    BYTE hdr[0x400];
+    try { drv.read_va(baseVa, hdr, sizeof(hdr)); }
+    catch (const std::exception& e) { Log("    [!] read_va(PE头) 失败: %s", e.what()); return false; }
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)hdr;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(hdr + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    WORD numSections = nt->FileHeader.NumberOfSections;
+    DWORD optHdrSize = nt->FileHeader.SizeOfOptionalHeader;
+    IMAGE_SECTION_HEADER* sec = (IMAGE_SECTION_HEADER*)(hdr + dos->e_lfanew + 4 + 20 + optHdrSize);
+
+    for (WORD i = 0; i < numSections; i++) {
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
+        if (sec[i].Misc.VirtualSize == 0) continue;
+        char name[9] = { 0 };
+        memcpy(name, sec[i].Name, 8);
+        uint64_t sva = baseVa + sec[i].VirtualAddress;
+        uint64_t ssz = sec[i].Misc.VirtualSize;
+        Log("[.]     尝试扫描可写段 %-8s VA=0x%llX 大小=0x%llX", name, (unsigned long long)sva, (unsigned long long)ssz);
+        if (ScanSectionForSig(drv, sva, ssz, outVa)) return true;
     }
     return false;
 }
@@ -333,32 +345,69 @@ static std::string FindDriverFile()
     char exe[MAX_PATH]; GetModuleFileNameA(NULL, exe, MAX_PATH);
     std::string dir = exe; dir = dir.substr(0, dir.find_last_of("\\/"));
     std::vector<std::string> cands = {
-        dir + "\\ASTRA64.sys",                          // exe 同目录
+        dir + "\\RTCore64.sys",                         // exe 同目录
     };
     for (auto& c : cands)
         if (GetFileAttributesA(c.c_str()) != INVALID_FILE_ATTRIBUTES) return c;
     return "";
 }
 
-static bool EnsureAstraDriver()
+static bool EnsureRtCoreDriver()
 {
     SC_HANDLE hSCM = OpenSCManagerA(NULL, NULL, SC_MANAGER_ALL_ACCESS);
     if (!hSCM) { Log("[-] OpenSCManager 失败 (%lu)", GetLastError()); return false; }
 
-    SC_HANDLE hSvc = OpenServiceA(hSCM, "ASTRA64", SERVICE_ALL_ACCESS);
+    std::string ourDrvPath = FindDriverFile();
+    if (ourDrvPath.empty()) { Log("[-] 未找到 RTCore64.sys"); CloseServiceHandle(hSCM); return false; }
+    // 归一化为小写、去掉扩展名前的目录差异，便于比较
+    std::string ourNorm = ourDrvPath;
+    std::transform(ourNorm.begin(), ourNorm.end(), ourNorm.begin(), ::tolower);
+
+    SC_HANDLE hSvc = OpenServiceA(hSCM, "RTCore64", SERVICE_ALL_ACCESS);
     if (!hSvc) {
         if (GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) {
-            std::string drvPath = FindDriverFile();
-            if (drvPath.empty()) { Log("[-] 未找到 ASTRA64.sys"); CloseServiceHandle(hSCM); return false; }
-            Log("[.] 服务不存在，从 %s 创建...", drvPath.c_str());
-            hSvc = CreateServiceA(hSCM, "ASTRA64", "ASTRA64", SERVICE_ALL_ACCESS,
+            Log("[.] 服务不存在，从 %s 创建...", ourDrvPath.c_str());
+            hSvc = CreateServiceA(hSCM, "RTCore64", "RTCore64", SERVICE_ALL_ACCESS,
                 SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
-                drvPath.c_str(), NULL, NULL, NULL, NULL, NULL);
+                ourDrvPath.c_str(), NULL, NULL, NULL, NULL, NULL);
             if (!hSvc) { Log("[-] CreateService 失败 (%lu)", GetLastError()); CloseServiceHandle(hSCM); return false; }
         } else {
             Log("[-] OpenService 失败 (%lu)", GetLastError());
             CloseServiceHandle(hSCM);
             return false;
+        }
+    } else {
+        // 服务已存在：检查二进制路径是否指向我们的 RTCore64.sys
+        DWORD need = 0;
+        QueryServiceConfigA(hSvc, NULL, 0, &need);
+        std::vector<BYTE> cfgBuf(need > 0 ? need : 4096);
+        LPQUERY_SERVICE_CONFIGA cfg = (LPQUERY_SERVICE_CONFIGA)cfgBuf.data();
+        if (QueryServiceConfigA(hSvc, cfg, (DWORD)cfgBuf.size(), &need) && cfg->lpBinaryPathName) {
+            std::string existing = cfg->lpBinaryPathName;
+            if (existing.rfind("\\??\\", 0) == 0) existing = existing.substr(4);
+            std::string existingNorm = existing;
+            std::transform(existingNorm.begin(), existingNorm.end(), existingNorm.begin(), ::tolower);
+            if (existingNorm != ourNorm) {
+                Log("[!] 已有 RTCore64 服务指向 %s（可能是 MSI Afterburner）", existing.c_str());
+                Log("[.]     停止旧服务并改指向 %s...", ourDrvPath.c_str());
+                SERVICE_STATUS st = { 0 };
+                if (QueryServiceStatus(hSvc, &st) && st.dwCurrentState != SERVICE_STOPPED) {
+                    ControlService(hSvc, SERVICE_CONTROL_STOP, &st);
+                    for (int i = 0; i < 50; i++) {
+                        Sleep(100);
+                        if (QueryServiceStatus(hSvc, &st) && st.dwCurrentState == SERVICE_STOPPED) break;
+                    }
+                }
+                if (!ChangeServiceConfigA(hSvc, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE,
+                    ourDrvPath.c_str(), NULL, NULL, NULL, NULL, NULL, NULL)) {
+                    Log("[-] ChangeServiceConfig 失败 (%lu)", GetLastError());
+                    CloseServiceHandle(hSvc); CloseServiceHandle(hSCM);
+                    return false;
+                }
+                Log("[+]     已将服务二进制路径改为我们的 RTCore64.sys");
+            } else {
+                Log("[+] 已有 RTCore64 服务指向相同文件，无需修改");
+            }
         }
     }
 
@@ -369,9 +418,9 @@ static bool EnsureAstraDriver()
         return false;
     }
     if (ss.dwCurrentState == SERVICE_RUNNING) {
-        Log("[+] ASTRA64 服务已运行");
+        Log("[+] RTCore64 服务已运行");
     } else {
-        Log("[.] 启动 ASTRA64 服务...");
+        Log("[.] 启动 RTCore64 服务...");
         if (!StartServiceA(hSvc, 0, NULL)) {
             DWORD e = GetLastError();
             if (e != ERROR_SERVICE_ALREADY_RUNNING) {
@@ -389,7 +438,7 @@ static bool EnsureAstraDriver()
             CloseServiceHandle(hSvc); CloseServiceHandle(hSCM);
             return false;
         }
-        Log("[+] ASTRA64 服务已启动");
+        Log("[+] RTCore64 服务已启动");
     }
 
     CloseServiceHandle(hSvc);
@@ -397,14 +446,40 @@ static bool EnsureAstraDriver()
     return true;
 }
 
-static bool OpenAstra(astra::Astra& drv)
+static bool OpenRtCore(rtcore::RTCore& drv)
 {
     try { drv.open(); return true; } catch (...) {}
-    Log("[.] ASTRA64 驱动未运行，检查/创建/启动服务...");
-    if (EnsureAstraDriver()) {
+    Log("[.] RTCore64 驱动未运行，检查/创建/启动服务...");
+    if (EnsureRtCoreDriver()) {
         try { drv.open(); return true; } catch (...) {}
     }
     return false;
+}
+
+static void StopAndDeleteRtCore()
+{
+    SC_HANDLE hSCM = OpenSCManagerA(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (!hSCM) { Log("[.] StopAndDeleteRtCore: OpenSCManager 失败 (%lu)", GetLastError()); return; }
+    SC_HANDLE hSvc = OpenServiceA(hSCM, "RTCore64", SERVICE_ALL_ACCESS);
+    if (!hSvc) { CloseServiceHandle(hSCM); return; }
+
+    SERVICE_STATUS ss = { 0 };
+    if (QueryServiceStatus(hSvc, &ss) && ss.dwCurrentState != SERVICE_STOPPED) {
+        ControlService(hSvc, SERVICE_CONTROL_STOP, &ss);
+        for (int i = 0; i < 50; i++) {
+            Sleep(100);
+            if (QueryServiceStatus(hSvc, &ss) && ss.dwCurrentState == SERVICE_STOPPED) break;
+        }
+    }
+    if (QueryServiceStatus(hSvc, &ss) && ss.dwCurrentState == SERVICE_STOPPED) {
+        if (DeleteService(hSvc)) Log("[+] RTCore64 服务已停止并删除");
+        else Log("[.] RTCore64 服务已停止但删除失败 (%lu)", GetLastError());
+    } else {
+        Log("[.] RTCore64 服务未能停止（可能有其他进程占用设备），跳过删除");
+    }
+
+    CloseServiceHandle(hSvc);
+    CloseServiceHandle(hSCM);
 }
 
 static bool SaveRawFile(const char* path, const BYTE* data, size_t len)
@@ -489,7 +564,20 @@ static std::string GetInstallDir()
     return "C:\\Program Files\\Sandboxie-Plus";
 }
 
+// 检查 .data 段是否可写（从内存中的 PE 头读 Characteristics）
+static bool IsSectionWritable(DWORD characteristics)
+{
+    return (characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+}
+
 // ---------------- 一键流程 ----------------
+// RAII：RunFlow 任何路径退出（包括提前 return）都停止并删除 RTCore64 服务。
+// 需在 drv 之前声明，保证析构顺序为 drv（关句柄）→ guard（停服务）。
+struct SvcGuard {
+    bool active = false;
+    ~SvcGuard() { if (active) StopAndDeleteRtCore(); }
+};
+
 void RunFlow(const std::string& name, const std::string& level, long long days)
 {
     Log("[*] 一键流程: name=\"%s\" level=%s days=%lld", name.c_str(), level.c_str(), days);
@@ -513,30 +601,46 @@ void RunFlow(const std::string& name, const std::string& level, long long days)
     Log("[+] 3/8 已生成 Certificate.dat / key.hex / mypub.hex");
     Log("    公钥: %s", Hex(pub).c_str());
 
-    // 4) 打开驱动
-    astra::Astra drv;
-    if (!OpenAstra(drv)) {
-        Log("[-] 4/8 无法打开 Astra64 驱动，补丁跳过（证书已生成，可稍后手动补丁）");
+    // 4) 打开驱动（guard 在 drv 之前声明，确保退出时先关句柄再停服务）
+    SvcGuard svcGuard;
+    rtcore::RTCore drv;
+    if (!OpenRtCore(drv)) {
+        Log("[-] 4/8 无法打开 RTCore64 驱动，补丁跳过（证书已生成，可稍后手动补丁）");
         return;
     }
-    Log("[+] 4/8 Astra64 驱动已打开");
+    svcGuard.active = true;
+    Log("[+] 4/8 RTCore64 驱动已打开");
 
     // 5) 定位
     uint64_t baseVa = GetDriverBase("SbieDrv.sys");
     if (!baseVa) { Log("[-] 5/8 未找到 SbieDrv.sys，补丁跳过"); return; }
     Log("[+] 5/8 SbieDrv.sys 基址 VA: 0x%llX", (unsigned long long)baseVa);
-    uint64_t cr3 = FindKernelCr3(drv, baseVa);
-    if (!cr3) { Log("[-] 5/8 未找到内核 CR3"); return; }
-    Log("[+]     CR3 (PML4) = 0x%llX", (unsigned long long)cr3);
-    uint64_t imageSize = 0;
-    if (!GetImageSize(drv, cr3, baseVa, imageSize)) { Log("[-] 5/8 读取驱动映像大小失败"); return; }
-    uint64_t keyVa = 0, keyPa = 0;
-    if (!ScanImageForSig(drv, cr3, baseVa, imageSize, keyVa, keyPa)) { Log("[-] 5/8 映像中未找到 ECS1 公钥"); return; }
-    Log("[+]     公钥 VA=0x%llX PA=0x%llX", (unsigned long long)keyVa, (unsigned long long)keyPa);
+    uint64_t dataVa = 0, dataSize = 0;
+    DWORD dataChars = 0;
+    bool dataFound = GetSectionRange(drv, baseVa, ".data", dataVa, dataSize, dataChars);
+    if (dataFound) {
+        Log("[+]     .data 段 VA=0x%llX 大小=0x%llX 属性=0x%08X", (unsigned long long)dataVa, (unsigned long long)dataSize, dataChars);
+        if (!IsSectionWritable(dataChars)) {
+            Log("[-] 5/8 .data 段没有 IMAGE_SCN_MEM_WRITE 标志，内核写入会导致 BSOD，跳过补丁");
+            return;
+        }
+        Log("[+]     .data 段已确认可写");
+    }
+    uint64_t keyVa = 0;
+    bool keyFound = false;
+    if (dataFound) {
+        keyFound = ScanSectionForSig(drv, dataVa, dataSize, keyVa);
+    }
+    if (!keyFound) {
+        Log("[.]     在 .data 中未找到 ECS1 或 .data 不可用，扫描所有可写段...");
+        keyFound = ScanAllWritableSections(drv, baseVa, keyVa);
+    }
+    if (!keyFound) { Log("[-] 5/8 驱动映像中未找到 ECS1 公钥"); return; }
+    Log("[+]     公钥 VA=0x%llX", (unsigned long long)keyVa);
 
     // 6) 备份 + 写入 + 读回校验
     BYTE orig[72] = { 0 };
-    try { drv.read_phys(keyPa, orig, 72); }
+    try { drv.read_va(keyVa, orig, 72); }
     catch (const std::exception& e) { Log("[-] 6/8 读取原公钥失败: %s", e.what()); return; }
     if (GetFileAttributesA("sbie_key_backup.bin") == INVALID_FILE_ATTRIBUTES) {
         if (SaveRawFile("sbie_key_backup.bin", orig, 72)) Log("[+] 6/8 原公钥已备份到 sbie_key_backup.bin");
@@ -545,13 +649,20 @@ void RunFlow(const std::string& name, const std::string& level, long long days)
         Log("[.] 6/8 备份文件已存在，跳过覆盖");
     }
 
-    try { drv.write_phys(keyPa, pub.data(), 72); }
+    // .data 段已确认可写，直接 4 字节写入（不使用 PTE 操作）
+    try {
+        for (size_t i = 0; i < 72; i += 4) {
+            uint32_t v;
+            memcpy(&v, pub.data() + i, 4);
+            drv.write_u32(keyVa + i, v);
+        }
+    }
     catch (const std::exception& e) { Log("[-] 6/8 写入失败: %s", e.what()); return; }
     BYTE chk[72] = { 0 };
-    try { drv.read_phys(keyPa, chk, 72); } catch (...) {}
+    try { drv.read_va(keyVa, chk, 72); } catch (...) {}
     if (memcmp(chk, pub.data(), 72) != 0) {
         Log("[-] 6/8 读回校验失败，自动还原...");
-        try { drv.write_phys(keyPa, orig, 72); } catch (...) {}
+        for (size_t i = 0; i < 72; i += 4) { uint32_t v; memcpy(&v, orig + i, 4); try { drv.write_u32(keyVa + i, v); } catch (...) {} }
         return;
     }
     Log("[+] 6/8 新公钥已写入并读回校验通过");
@@ -606,4 +717,4 @@ void RunRestore()
     Log("[*] 还原完成。若驱动内存补丁仍在，请重启系统以彻底恢复原公钥。");
 }
 
-} // namespace va2pa
+} // namespace sbu
