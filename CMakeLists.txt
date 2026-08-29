@@ -13,6 +13,7 @@ endif()
 add_executable(SandBoxieUnlocker WIN32
     src/main.cpp
     src/core.cpp
+    src/windows_security_check.cpp
 )
 
 target_include_directories(SandBoxieUnlocker PRIVATE

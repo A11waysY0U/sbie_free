@@ -14,6 +14,7 @@
 #include <cstdio>
 
 #include "core.h"
+#include "windows_security_check.h"
 
 // 启用 Common Controls v6 视觉样式（按钮/编辑框/下拉框现代外观）
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -189,6 +190,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             WideCharToMultiByte(CP_UTF8, 0, name, -1, nameA, sizeof(nameA), NULL, NULL);
             WideCharToMultiByte(CP_UTF8, 0, level, -1, levelA, sizeof(levelA), NULL, NULL);
             SetWindowTextW(g_hLog, L"");
+            if (sbu::CheckSecuritySoftware(hWnd)) break;
             StartFlowAsync(hWnd, nameA, levelA, days);
         } else if (LOWORD(wParam) == IDC_BTN_RESTORE) {
             SetWindowTextW(g_hLog, L"");
