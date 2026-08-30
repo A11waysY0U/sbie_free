@@ -121,7 +121,7 @@ bool sbu::CheckSecuritySoftware(HWND hwndParent)
             blockers);
         MessageBoxW(hwndParent, msg, L"内核安全特性冲突",
             MB_OK | MB_ICONWARNING | MB_TOPMOST);
-        return true; // 阻止加载
+        return false; 
     }
 
     // --- 2) 第三方安全软件进程检测 ---
@@ -135,7 +135,7 @@ bool sbu::CheckSecuritySoftware(HWND hwndParent)
                 proc);
             MessageBoxW(hwndParent, msg, L"安全软件冲突警告",
                 MB_OK | MB_ICONWARNING | MB_TOPMOST);
-            return true; // 阻止加载
+            return false;
         }
     }
 

@@ -174,6 +174,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         ApplyFont(g_hLog, g_hFontMono);
 
         UiLog("[*] 填写姓名/级别/天数后点击 [开始注册]");
+        UiLog("[*] 项目地址: https://github.com/A11waysY0U/sbie_free");
         break;
     }
     case WM_COMMAND: {
